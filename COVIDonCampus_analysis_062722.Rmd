@@ -1,0 +1,934 @@
+---
+title: "COVID_on_Campus"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Desktop/UIUC Postdoc Materials/COVID_on_campus/Data")
+
+#Load all relevant packages and data
+library(readr)
+library(readxl)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+
+#University data
+all_universities <- read_csv('Colleges_and_Universities_Type_Pop_Enroll_HousingCapacity_Employees.csv')
+campus_attributes <-read_csv('CollegeAttributes.csv')
+testing_plans <-read_csv('COVID_testing.csv')
+mask_usage <-read_xlsx('mask-use-by-county.xlsx')
+
+##University MOI data from CC2i
+all_RTC_plansFA2020 <- read_csv('MOI Panel Data Fall 2020_RA.csv')
+#selecting RTC plans as of 1 Sept 2020
+all_RTC_plansFA2020$date<-factor(all_RTC_plansFA2020$date)
+
+RTCplansFA2020<-all_RTC_plansFA2020 %>%
+   filter(date=="01sep2020")
+RTCplansFA2020$unitid<-factor(RTCplansFA2020$unitid)
+
+##Testing regimes from C2i
+testingplans_FA20SP21<- read_csv('COVID-19 Testing Regimes Fall 20 and Spring 21_RA.csv')
+testingplans_FA20SP21$test_f20<-factor(testingplans_FA20SP21$test_f20)
+testingplansFA20 <-testingplans_FA20SP21 %>%
+  select(-test_s21)
+
+ 
+#Merging testing plans and RTC datasets
+MOI_testingFA20<- merge(RTCplansFA2020, testingplansFA20, by = "unitid") %>%
+   select(-mode_c2ishort, -mode_c2itiny, -date) %>%
+   rename(Institution = insname, MOI = mode_c2ilong, Test_Type = test_f20, State = fips) 
+   
+MOI_testingFA20$Test_Type<-MOI_testingFA20$Test_Type %>%replace_na('No testing mentioned')
+
+
+#COVID case/death data from NYT
+COVID_timeseries_NYT <- read_xlsx('cases_death_us_counties_122820.xlsx')
+
+#Human population data 
+county_pop <-read_xlsx('countypop2019.xlsx')
+
+#COVID provisional deaths from CDC
+provisional_deaths_CDC <- read_csv('Provisional_COVID-19_Death_Counts_in_the_United_States_by_County.csv')
+
+#County Economic Demographics/State Mask Mandate
+county_economic_demographics <-read_xls('Economic_variables.xls')
+
+#age-adjusted cases/mortality by race
+age_race_cases_county <- read_xlsx('race_ethnicity_byagegroup_bycounty.xlsx')
+
+```
+
+```{r}
+#Selecting/filtering/cleaning datasets before merging into master
+
+#Selecting relevant columns and removing community colleges from IPEDS Campus Attributes dataset (Merge using Institution Name)
+four_yr_institutions<-campus_attributes %>%
+  select(`institution name`, `HD2019.FIPS state code`, `HD2019.Institution size category`, `HD2019.Level of institution`, `HD2019.Control of institution`, `HD2019.Land Grant Institution`, `IC2019.NCAA/NAIA conference number football`, `HD2019.Degree of urbanization (Urban-centric locale)`) %>%
+    filter(`HD2019.Level of institution` == 'Four or more years')
+
+#Renaming data columns
+four_yr_institutions <-rename(four_yr_institutions, c("Institution" = `institution name`,"State" = `HD2019.FIPS state code`, "Institution_size" = `HD2019.Institution size category`, "Institution_level" = `HD2019.Level of institution`, "Institution_category" = `HD2019.Control of institution`, "Land_grant" = `HD2019.Land Grant Institution`, "Football_Conference" = `IC2019.NCAA/NAIA conference number football`, "Degree_urbanized" = `HD2019.Degree of urbanization (Urban-centric locale)`))
+ 
+four_yr_institutions$Institution <- factor(four_yr_institutions$Institution)
+four_yr_institutions$State <- factor(four_yr_institutions$State)
+four_yr_institutions$Institution_size <-factor(four_yr_institutions$Institution_size)
+four_yr_institutions$Institution_level <- factor(four_yr_institutions$Institution_level)
+four_yr_institutions$Institution_category <- factor(four_yr_institutions$Institution_category)
+four_yr_institutions$Land_grant <- factor(four_yr_institutions$Land_grant)
+four_yr_institutions$Football_Conference <- factor(four_yr_institutions$Football_Conference)
+four_yr_institutions$Degree_urbanized <-factor(four_yr_institutions$Degree_urbanized)
+
+
+#Organizing MOI/Testing Dataset
+MOI_testingFA20$Institution <-factor(MOI_testingFA20$Institution)
+MOI_testingFA20$MOI <- factor(MOI_testingFA20$MOI)
+MOI_testingFA20$Test_Type <-factor(MOI_testingFA20$Test_Type)
+
+#Merging University Attribute and MOI/Testing Plan Datasets on Insitution Name
+fouryrinstitutions_COVIDplans <- left_join(four_yr_institutions, MOI_testingFA20, by = 'Institution') %>%
+   select(-State.y)%>%
+   rename(State = State.x) %>%
+   drop_na()
+fouryrinstitutions_COVIDplans$Football_Conference<-as.character(fouryrinstitutions_COVIDplans$Football_Conference)
+fouryrinstitutions_COVIDplans["Football_Conference"][fouryrinstitutions_COVIDplans["Football_Conference"]=="Not applicable"] <- "None"
+fouryrinstitutions_COVIDplans$Football_Conference<-factor(fouryrinstitutions_COVIDplans$Football_Conference)
+
+```
+
+```{r} 
+#Organizing `All Universities` dataset (to set up FIPS/county/Institution merge w/ mask wearing and NYT/CDC COVID case/death datasets)
+library(stringr)
+
+university_data <- all_universities %>%
+  select(NAME, CITY,COUNTY, COUNTYFIPS, NAICS_DESC) %>%
+  filter(NAICS_DESC == "COLLEGES, UNIVERSITIES, AND PROFESSIONAL SCHOOLS")
+
+university_data <- rename(university_data, c("Institution" = `NAME`, "City" = `CITY`, "County" = `COUNTY`, "FIPS" = `COUNTYFIPS`, "University_type" = `NAICS_DESC`))
+
+#Converting upper case data to title/sentence Case
+university_data$Institution <- str_to_title(university_data$Institution)
+university_data$City <- str_to_title(university_data$City)
+university_data$County <-str_to_title(university_data$County)
+university_data$University_type <-str_to_title(university_data$University_type)
+```
+
+```{r}
+#Mask usage grouping into broader categories of use (Low, Moderate, High)
+
+mask_wearing_percentage <- mask_usage %>%
+  select(County, NEVER, RARELY, SOMETIMES, FREQUENTLY, ALWAYS, new_fips)
+  
+mask_wearing_percentage$Mask_usage_category[mask_wearing_percentage$NEVER > 0.1]  = "Low"
+mask_wearing_percentage$Mask_usage_category[mask_wearing_percentage$RARELY > 0.1]  = "Low"
+mask_wearing_percentage$Mask_usage_category[mask_wearing_percentage$SOMETIMES > 0.2]  = "Moderate"
+mask_wearing_percentage$Mask_usage_category[mask_wearing_percentage$FREQUENTLY > 0.2]  = "Moderate"
+mask_wearing_percentage$Mask_usage_category[mask_wearing_percentage$ALWAYS > 0.5]  = "High"
+
+mask_wearing_percentage <-rename(mask_wearing_percentage, c("FIPS" = `new_fips`))
+mask_wearing_percentage$FIPS <-factor(mask_wearing_percentage$FIPS)
+mask_wearing_percentage$Mask_usage_category <- factor(mask_wearing_percentage$Mask_usage_category)
+```
+
+```{r}
+#Merging University data and NYT COVID case/death timeseries data
+
+universities_full <- full_join(fouryrinstitutions_COVIDplans, university_data, by = "Institution")
+universities_full$FIPS<-factor(universities_full$FIPS)
+
+
+universities_full$Institution<-factor(universities_full$Institution)
+
+#Export to fill in Cities/FIPS that didn't match
+write.csv(universities_full, "University_Full_FILL_IN_MISSING_DATA.csv")
+
+#Reload Fixed University Data
+universities_full_FIXED<-read_csv("University_Full_complete.csv")
+universities_full_FIXED$Football_Conference<-as.character(universities_full_FIXED$Football_Conference)
+universities_full_FIXED["Football_Conference"][universities_full_FIXED["Football_Conference"]=="Not applicable"] <- "None"
+universities_full_FIXED$Football_Conference<-factor(universities_full_FIXED$Football_Conference)
+universities_full_FIXED$FIPS<-factor(universities_full_FIXED$FIPS)
+
+
+#Nationwide County Enrollment data from IPEDS for 2019
+county_enrollment<- read_csv("CountyEnrollment.csv")
+
+#Adding county mask-wearing trend
+universities_maskwearing <- left_join(universities_full_FIXED, mask_wearing_percentage, by = c("FIPS", "County")) 
+universities_maskwearing$Mask_usage_category<-as.character(universities_maskwearing$Mask_usage_category)
+universities_maskwearing$Mask_usage_category %>% replace_na('Unknown')
+universities_maskwearing$Mask_usage_category<-factor(universities_maskwearing$Mask_usage_category)
+                             
+#Adding county enrollment data
+universities_countyenrollment<- left_join(universities_maskwearing, county_enrollment, by = c("FIPS", "County"))
+
+#Removing 4yr college columns and masking-wearing percentages from compiled university dataset
+universities_clean <- universities_countyenrollment %>%
+  select(-Institution_level, -University_type, -NEVER, -RARELY, -SOMETIMES, -FREQUENTLY, -ALWAYS, -State.y) %>%
+   rename(State = State.x)
+
+universities_clean$Mask_usage_category<-as.character(universities_clean$Mask_usage_category)
+universities_clean$Mask_usage_category %>% replace_na('Unknown')
+universities_clean$Mask_usage_category<-factor(universities_clean$Mask_usage_category)
+
+#Final University Dataset
+universities_clean$FIPS <- factor(universities_clean$FIPS)
+
+#Export Final University Dataset to Fix NAs/mismatches from merges
+final_university_dataset_FIX<-write_csv(universities_clean, "Final_University_Dataset_FIX.csv")
+
+#Uploading fixed University Dataset
+final_university_dataset <-read_csv("Final_University_Dataset.csv")
+str_pad(final_university_dataset$FIPS, 5, pad = "0")
+```
+
+```{r}
+#Renaming columns for consistency across datasets
+COVID_timeseries_NYT_clean <- rename(COVID_timeseries_NYT, c("Date" = `date`, "County" = `county`, "State" = `state`, "FIPS" = `fips`, "Cases" = `cases`, "Deaths" = `deaths`))
+
+#Removing combined county/state column
+COVID_case_death_NYT <- COVID_timeseries_NYT_clean %>%
+  select(-`co_st`)
+
+COVID_case_death_NYT$FIPS <- as.factor(COVID_case_death_NYT$FIPS)
+COVID_case_death_NYT$Date <-ymd(COVID_case_death_NYT$Date)
+```
+
+```{r}
+#Adding County Populations
+county_pop_clean <- county_pop %>%
+  select(County, State, `2019_Population_Estimate`)
+
+university_countypop <-left_join(final_university_dataset, county_pop_clean, by = c("County","State"), all.x=TRUE)
+
+university_countypop_FIX<-write_csv(university_countypop, "University_countypop_FIX.csv")
+university_countypop_clean<-read_csv("University_countypop_Complete.csv")
+
+university_countypop$FIPS <-factor(university_countypop$FIPS)
+
+#Adding County Economic Data
+university_countypop_economic <-left_join(university_countypop_clean, county_economic_demographics, by =("FIPS"))
+university_countypop_economic_clean <-university_countypop_economic %>%
+  select(-County.y, -State.y, -Civilian_labor_force_2019, -Employed_2019, -Unemployed_2019) %>%
+  rename("County" = County.x, "State" = State.x)
+
+university_countypop_economic_clean$FIPS <-factor(university_countypop_economic_clean$FIPS)
+
+#Adding age and race data
+age_race_cases_county$FIPS <- factor(age_race_cases_county$FIPS)
+
+#Manipulating age/race data to be percent of a county
+age_adjusted_race_case_mortality_wide <- age_race_cases_county %>% 
+  select(FIPS, State, County, age_group_updated,`age-adjusted case rate_white`, `age-adjusted mortality rate_white`, `age-adjusted case rate_black`, `age-adjusted mortality rate_black`, `age-adjusted case rate_nativeamerican`, `age-adjusted mortality rate_nativeamerican`,`age-adjusted case rate_asian`, `age-adjusted mortality rate_asian`,`age-adjusted case rate_hispanic`, `age-adjusted mortality rate_hispanic`) %>%
+  pivot_wider(
+    names_from = c(age_group_updated),
+    values_from = c(`age-adjusted case rate_white`, `age-adjusted mortality rate_white`, `age-adjusted case rate_black`, `age-adjusted mortality rate_black`, `age-adjusted case rate_nativeamerican`, `age-adjusted mortality rate_nativeamerican`,`age-adjusted case rate_asian`, `age-adjusted mortality rate_asian`,`age-adjusted case rate_hispanic`, `age-adjusted mortality rate_hispanic`),  
+    )
+    
+#Adding university data to age-adjusted race data
+university_countypop_economic_clean_age_race <- left_join(university_countypop_economic_clean, age_adjusted_race_case_mortality_wide, by = ("FIPS")) %>%
+  select(-State.y, -County.y) %>%
+  rename(State = State.x,
+         County= County.x)
+
+```
+  
+```{r}
+#Full university + NYT COVID cases dataset
+
+NYT_COVID_Case_Death_wide <- COVID_case_death_NYT %>%
+  select(-Date) %>%
+ group_by(FIPS, County) %>%
+  summarise(Cases = sum(Cases), Deaths = sum(Deaths))
+
+  
+NYTCOVID_universities_outoford <-right_join(NYT_COVID_Case_Death_wide, university_countypop_economic_clean_age_race, by = c("FIPS", "County")) 
+
+#Reordering columns
+col_order <- c("Institution", "City", "County", "State", "Total_County_Enrollment", "FIPS", 
+             "Institution_size", "Institution_category", "Land_grant", "Football_Conference","Degree_urbanized",
+               "unitid", "MOI", "Test_Type","State_Mask_Mandate", "Mask_usage_category", 
+               "Unemployment_rate_2019", "Median_Household_Income_2019", "Med_HH_Income_Percent_of_State_Total_2019",
+               "2019_Population_Estimate",  
+               "age-adjusted case rate_white_0 - 9 Years","age-adjusted case rate_white_10 - 19 Years", 
+               "age-adjusted case rate_white_20 - 29 Years",
+               "age-adjusted case rate_white_30 - 39 Years", "age-adjusted case rate_white_40 - 49 Years",
+   "age-adjusted case rate_white_50 - 59 Years", "age-adjusted case rate_white_60 - 69 Years",
+   "age-adjusted case rate_white_70 - 79 Years", "age-adjusted case rate_white_80+ Years",
+   "age-adjusted mortality rate_white_0 - 9 Years", "age-adjusted mortality rate_white_10 - 19 Years",
+   "age-adjusted mortality rate_white_20 - 29 Years", "age-adjusted mortality rate_white_30 - 39 Years",
+   "age-adjusted mortality rate_white_40 - 49 Years", "age-adjusted mortality rate_white_50 - 59 Years",
+   "age-adjusted mortality rate_white_60 - 69 Years", "age-adjusted mortality rate_white_70 - 79 Years",
+   "age-adjusted mortality rate_white_80+ Years", "age-adjusted case rate_black_0 - 9 Years",
+   "age-adjusted case rate_black_10 - 19 Years" , "age-adjusted case rate_black_20 - 29 Years" ,
+   "age-adjusted case rate_black_30 - 39 Years" , "age-adjusted case rate_black_40 - 49 Years" ,
+   "age-adjusted case rate_black_50 - 59 Years" , "age-adjusted case rate_black_60 - 69 Years" ,
+   "age-adjusted case rate_black_70 - 79 Years" , "age-adjusted case rate_black_80+ Years" ,
+   "age-adjusted mortality rate_black_0 - 9 Years" , "age-adjusted mortality rate_black_10 - 19 Years" ,
+   "age-adjusted mortality rate_black_20 - 29 Years" , "age-adjusted mortality rate_black_30 - 39 Years" ,
+   "age-adjusted mortality rate_black_40 - 49 Years" , "age-adjusted mortality rate_black_50 - 59 Years" ,
+   "age-adjusted mortality rate_black_60 - 69 Years" , "age-adjusted mortality rate_black_70 - 79 Years" ,
+   "age-adjusted mortality rate_black_80+ Years" , "age-adjusted case rate_nativeamerican_0 - 9 Years" ,
+   "age-adjusted case rate_nativeamerican_10 - 19 Years" , "age-adjusted case rate_nativeamerican_20 - 29 Years" ,
+   "age-adjusted case rate_nativeamerican_30 - 39 Years" , "age-adjusted case rate_nativeamerican_40 - 49 Years" ,
+   "age-adjusted case rate_nativeamerican_50 - 59 Years" , "age-adjusted case rate_nativeamerican_60 - 69 Years" ,
+   "age-adjusted case rate_nativeamerican_70 - 79 Years" , "age-adjusted case rate_nativeamerican_80+ Years" ,
+   "age-adjusted mortality rate_nativeamerican_0 - 9 Years" ,
+   "age-adjusted mortality rate_nativeamerican_10 - 19 Years" ,
+   "age-adjusted mortality rate_nativeamerican_20 - 29 Years" ,
+   "age-adjusted mortality rate_nativeamerican_30 - 39 Years" ,
+   "age-adjusted mortality rate_nativeamerican_40 - 49 Years" ,
+   "age-adjusted mortality rate_nativeamerican_50 - 59 Years" ,
+   "age-adjusted mortality rate_nativeamerican_60 - 69 Years" ,
+   "age-adjusted mortality rate_nativeamerican_70 - 79 Years" ,
+   "age-adjusted mortality rate_nativeamerican_80+ Years" , "age-adjusted case rate_asian_0 - 9 Years" ,
+   "age-adjusted case rate_asian_10 - 19 Years" , "age-adjusted case rate_asian_20 - 29 Years" ,
+   "age-adjusted case rate_asian_30 - 39 Years" , "age-adjusted case rate_asian_40 - 49 Years" ,
+   "age-adjusted case rate_asian_50 - 59 Years" , "age-adjusted case rate_asian_60 - 69 Years" ,
+   "age-adjusted case rate_asian_70 - 79 Years" , "age-adjusted case rate_asian_80+ Years" ,
+   "age-adjusted mortality rate_asian_0 - 9 Years" , "age-adjusted mortality rate_asian_10 - 19 Years" ,
+   "age-adjusted mortality rate_asian_20 - 29 Years" , "age-adjusted mortality rate_asian_30 - 39 Years" ,
+   "age-adjusted mortality rate_asian_40 - 49 Years" , "age-adjusted mortality rate_asian_50 - 59 Years" ,
+   "age-adjusted mortality rate_asian_60 - 69 Years" , "age-adjusted mortality rate_asian_70 - 79 Years" ,
+   "age-adjusted mortality rate_asian_80+ Years" , "age-adjusted case rate_hispanic_0 - 9 Years" ,
+   "age-adjusted case rate_hispanic_10 - 19 Years" , "age-adjusted case rate_hispanic_20 - 29 Years" ,
+   "age-adjusted case rate_hispanic_30 - 39 Years" , "age-adjusted case rate_hispanic_40 - 49 Years" ,
+   "age-adjusted case rate_hispanic_50 - 59 Years" , "age-adjusted case rate_hispanic_60 - 69 Years" ,
+   "age-adjusted case rate_hispanic_70 - 79 Years" , "age-adjusted case rate_hispanic_80+ Years" ,
+   "age-adjusted mortality rate_hispanic_0 - 9 Years" , "age-adjusted mortality rate_hispanic_10 - 19 Years" ,
+   "age-adjusted mortality rate_hispanic_20 - 29 Years" , "age-adjusted mortality rate_hispanic_30 - 39 Years" ,
+   "age-adjusted mortality rate_hispanic_40 - 49 Years" , "age-adjusted mortality rate_hispanic_50 - 59 Years", "age-adjusted mortality rate_hispanic_60 - 69 Years", "age-adjusted mortality rate_hispanic_70 - 79 Years", "age-adjusted mortality rate_hispanic_80+ Years", "Cases", "Deaths")  
+               
+             
+      
+NYTCOVID_universities_clean <- NYTCOVID_universities_outoford[, col_order]
+
+NYTCOVID_universities_clean$State_Mask_Mandate <- factor(NYTCOVID_universities_clean$State_Mask_Mandate)
+```
+
+```{r}
+#Sum the cases/deaths per university and county pop
+library(FactoMineR)
+library(factoextra)
+library(timetk)
+library(PCAmixdata)
+
+pop_adj_county_case_deaths <-NYTCOVID_universities_clean %>%
+  mutate(County_pop_adjusted_cases_per1000 = (Cases/`2019_Population_Estimate`)*1000) %>%
+  mutate(County_pop_adjusted_deaths_per1000 = (Deaths/`2019_Population_Estimate`)*1000) %>%
+  select(-City, -State, -Deaths, -County) %>%
+   drop_na(County_pop_adjusted_cases_per1000)
+
+str_pad(pop_adj_county_case_deaths$FIPS, 5, pad = "0")
+
+summary(pop_adj_county_case_deaths$County_pop_adjusted_cases_per1000)
+
+#Categorizing county enrollment sizes into Johnny's categories
+ #large = x ≥15000, 
+ #medium = 15000 > x > 5000, 
+ #small = 5000 ≥ x > 0,
+ #absent = 0
+
+pop_adj_county_case_deaths$County_Enrollment_Size<- cut(pop_adj_county_case_deaths$Total_County_Enrollment,
+                                                        breaks = c(-1,0,5000,15000,750000),
+                                                        labels = c('Absent', 'Small', 'Medium', 'Large'))
+summary(pop_adj_county_case_deaths$County_Enrollment_Size)
+length(unique(pop_adj_county_case_deaths$Total_County_Enrollment))
+
+
+pop_adj_county_case_deaths$County_Enrollment_Size<- factor(pop_adj_county_case_deaths$County_Enrollment_Size)
+pop_adj_county_case_deaths$Institution_size<-factor(pop_adj_county_case_deaths$Institution_size)
+pop_adj_county_case_deaths$Institution_category<-factor(pop_adj_county_case_deaths$Institution_category)
+pop_adj_county_case_deaths$Land_grant<-factor(pop_adj_county_case_deaths$Land_grant)
+pop_adj_county_case_deaths$Football_Conference<-factor(pop_adj_county_case_deaths$Football_Conference)
+pop_adj_county_case_deaths$Degree_urbanized<-factor(pop_adj_county_case_deaths$Degree_urbanized)
+pop_adj_county_case_deaths$MOI<-factor(pop_adj_county_case_deaths$MOI)
+pop_adj_county_case_deaths$Test_Type<-factor(pop_adj_county_case_deaths$Test_Type)
+pop_adj_county_case_deaths$State_Mask_Mandate<-factor(pop_adj_county_case_deaths$State_Mask_Mandate)
+pop_adj_county_case_deaths$Mask_usage_category<-factor(pop_adj_county_case_deaths$Mask_usage_category)
+
+summary(pop_adj_county_case_deaths$MOI)
+
+#Final University/Economic Dataset for Factor Analysis
+Final_dataset<- pop_adj_county_case_deaths %>%
+   select(-Total_County_Enrollment)
+
+length(unique(Final_dataset$FIPS))
+length(unique(Final_dataset$Institution))
+length(unique(Final_dataset$unitid))
+
+summary(pop_adj_county_case_deaths$Cases)
+
+   #mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+```
+
+```{r}
+#("age-adjusted case rate_white_0 - 9 Years",
+                    "age-adjusted case rate_white_10 - 19 Years", "age-adjusted case rate_white_20 - 29 Years" ,
+                    "age-adjusted case rate_white_30 - 39 Years" , "age-adjusted case rate_white_40 - 49 Years",
+                    "age-adjusted case rate_white_50 - 59 Years" , "age-adjusted case rate_white_60 - 69 Years" ,
+                    "age-adjusted case rate_white_70 - 79 Years" , "age-adjusted case rate_white_80+ Years" ,
+                    "age-adjusted case rate_black_0 - 9 Years" ,
+                     "age-adjusted case rate_black_10 - 19 Years" , "age-adjusted case rate_black_20 - 29 Years" ,
+                     "age-adjusted case rate_black_30 - 39 Years" , "age-adjusted case rate_black_40 - 49 Years" ,
+                     "age-adjusted case rate_black_50 - 59 Years" , "age-adjusted case rate_black_60 - 69 Years" ,
+                     "age-adjusted case rate_black_70 - 79 Years" , "age-adjusted case rate_black_80+ Years" ,
+                     "age-adjusted case rate_nativeamerican_0 - 9 Years" ,
+                     "age-adjusted case rate_nativeamerican_10 - 19 Years" , "age-adjusted case rate_nativeamerican_20 - 29 Years" ,
+                     "age-adjusted case rate_nativeamerican_30 - 39 Years" , "age-adjusted case rate_nativeamerican_40 - 49 Years" ,
+                     "age-adjusted case rate_nativeamerican_50 - 59 Years" , "age-adjusted case rate_nativeamerican_60 - 69 Years" ,
+                     "age-adjusted case rate_nativeamerican_70 - 79 Years" , "age-adjusted case rate_nativeamerican_80+ Years" ,
+                    "age-adjusted case rate_asian_0 - 9 Years" ,
+                     "age-adjusted case rate_asian_10 - 19 Years" , "age-adjusted case rate_asian_20 - 29 Years" ,
+                     "age-adjusted case rate_asian_30 - 39 Years" , "age-adjusted case rate_asian_40 - 49 Years" ,
+                     "age-adjusted case rate_asian_50 - 59 Years" , "age-adjusted case rate_asian_60 - 69 Years" ,
+                     "age-adjusted case rate_asian_70 - 79 Years" , "age-adjusted case rate_asian_80+ Years" ,
+                     "age-adjusted case rate_hispanic_0 - 9 Years" ,
+                     "age-adjusted case rate_hispanic_10 - 19 Years" , "age-adjusted case rate_hispanic_20 - 29 Years" ,
+                     "age-adjusted case rate_hispanic_30 - 39 Years" , "age-adjusted case rate_hispanic_40 - 49 Years" ,
+                     "age-adjusted case rate_hispanic_50 - 59 Years" , "age-adjusted case rate_hispanic_60 - 69 Years" ,
+                     "age-adjusted case rate_hispanic_70 - 79 Years" , "age-adjusted case rate_hispanic_80+ Years" ,
+                    "age-adjusted mortality rate_white_0 - 9 Years" , "age-adjusted mortality rate_white_10 - 19 Years",
+                     "age-adjusted mortality rate_white_20 - 29 Years" , "age-adjusted mortality rate_white_30 - 39 Years" ,
+                     "age-adjusted mortality rate_white_40 - 49 Years" , "age-adjusted mortality rate_white_50 - 59 Years" ,
+                     "age-adjusted mortality rate_white_60 - 69 Years" , "age-adjusted mortality rate_white_70 - 79 Years" ,
+                     "age-adjusted mortality rate_white_80+ Years", 
+                    "age-adjusted mortality rate_black_0 - 9 Years" , 
+                    "age-adjusted mortality rate_black_10 - 19 Years","age-adjusted mortality rate_black_20 - 29 Years" , 
+                    "age-adjusted mortality rate_black_30 - 39 Years" ,
+                     "age-adjusted mortality rate_black_40 - 49 Years" , "age-adjusted mortality rate_black_50 - 59 Years" ,
+                     "age-adjusted mortality rate_black_60 - 69 Years" , "age-adjusted mortality rate_black_70 - 79 Years" ,
+                     "age-adjusted mortality rate_black_80+ Years", "age-adjusted mortality rate_nativeamerican_0 - 9 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_10 - 19 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_20 - 29 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_30 - 39 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_40 - 49 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_50 - 59 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_60 - 69 Years" ,
+                     "age-adjusted mortality rate_nativeamerican_70 - 79 Years" ,
+                      "age-adjusted mortality rate_nativeamerican_80+ Years",  
+                    "age-adjusted mortality rate_asian_0 - 9 Years" , 
+                    "age-adjusted mortality rate_asian_10 - 19 Years", 
+                    "age-adjusted mortality rate_asian_20 - 29 Years" , 
+                    "age-adjusted mortality rate_asian_30 - 39 Years" ,
+                    "age-adjusted mortality rate_asian_40 - 49 Years" , "age-adjusted mortality rate_asian_50 - 59 Years" ,
+                    "age-adjusted mortality rate_asian_60 - 69 Years" , "age-adjusted mortality rate_asian_70 - 79 Years" ,
+                    "age-adjusted mortality rate_asian_80+ Years" ,  
+                    "age-adjusted mortality rate_hispanic_0 - 9 Years" , "age-adjusted mortality rate_hispanic_10 - 19 Years" ,
+                    "age-adjusted mortality rate_hispanic_20 - 29 Years" , "age-adjusted mortality rate_hispanic_30 - 39 Years" ,
+                    "age-adjusted mortality rate_hispanic_40 - 49 Years" , "age-adjusted mortality rate_hispanic_50 - 59 Years",
+                    "age-adjusted mortality rate_hispanic_60 - 69 Years", "age-adjusted mortality rate_hispanic_70 - 79 Years",
+                    "age-adjusted mortality rate_hispanic_80+ Years",) 
+
+#Group 5 (s): Age/race-adjusted case rates (quantitative) [group 45, "Age_Race_COVID_Case_Rates"] (All age/race case categories)
+
+#Group 6 (s): Age/race-adjusted death rates (quantitative) [group 45, Age_Race_COVID_Death_Rates] (All age/race death categories)
+```
+
+```{r}
+#Combining MOI into categories (Hybrid, In-person, None, Online, Unknown)
+library(forcats)
+
+col_order <- c("Institution_category", "Institution_size", "Land_grant", "Test_Type", "MOI", "State_Mask_Mandate", "Mask_usage_category", "County_Enrollment_Size", "Unemployment_rate_2019", "Median_Household_Income_2019", "Med_HH_Income_Percent_of_State_Total_2019","County_pop_adjusted_cases_per1000")
+               
+#final dataset                   
+Final_dataset_ordered <- Final_dataset[, col_order]
+
+
+Final_dataset$MOI_Cat<- fct_collapse(Final_dataset_ordered$MOI,
+                                     Hybrid = c("50-50 online and in person", "Hyflex teaching", 
+                                                "Professor's choice", "Simultaneous teaching", 
+                                                "Some variety of methods, non specific plan"),
+                                  Inperson = c("Fully in person", "Primarily in person, some courses online"),
+                                  None = "Closed",
+                                  Online = c("Already an online institution", "Fully online, at least some students allowed on campus",                                    "Fully online, no students on campus", 
+                                             "Primarily online, some courses in person",
+                                             "Primarily online, with delayed transition to in-person instruction"),
+                                  Unknown = c("Unknown / TBD", "No COVID mentions", "Other"))
+
+summary(Final_dataset$MOI_Cat)
+
+#Combining Urbanization Categories
+Final_dataset$Urban_cat<- fct_collapse(Final_dataset$Degree_urbanized,
+                                       City = c("City: Large", "City: Midsize", "City: Small"),
+                                       Rural = c("Rural: Distant", "Rural: Fringe", "Rural: Remote"),
+                                       Suburb = c("Suburb: Large", "Suburb: Midsize", "Suburb: Small"),
+                                       Town = c("Town: Distant", "Town: Fringe", "Town: Remote"))
+summary(Final_dataset$Urban_cat)
+
+col_order_new <- c("Institution_category", "Institution_size", "Land_grant", "Test_Type", "Urban_cat", "MOI_Cat", "State_Mask_Mandate", "Mask_usage_category", "County_Enrollment_Size", "Unemployment_rate_2019", "Median_Household_Income_2019", "Med_HH_Income_Percent_of_State_Total_2019","County_pop_adjusted_cases_per1000")
+
+Final_dataset_ordered <- Final_dataset[, col_order_new]
+```
+
+```{r}
+###Ordering the columns for FAMD active variable grouping
+
+#Group 1 (n): Institution description (qualitative) [group = 4 columns, "Institution_Description"] ("Institution_category","Institution_size", "Land_grant","Urban_cat")
+
+#Group 2 (n): COVID mitigation strategies on campus (qualitative) [group = 3 columns, "Campus_COVID_mitigation"] ("MOI_Cat", "Test_Type")
+
+#Group 3 (n): County descriptions (qualitative): [group = 3 columns,"County_Level_Descriptions"] ("State_Mask_Mandate", "Mask_Usage_Category", "County_Enrollment_Size")
+
+#Group 4 (s): Economic demographics (quantitative) [group = 3 columns, "Economic_Demographics"] ("Unemployment_Rate_2019", "Median_Household_Income_2019", Med_HH_Income_Percent_of_State_Total")
+
+#Group 5 (s): Campus/County pop adjusted cases (quantitative) [group = 1 columns, "COVID_Cases"] ( "County_pop_adjusted_cases_per1000")
+
+#Group 6 (s): Campus/County pop adjusted death in county (quantitative) [group = 1 columns, "COVID_Deaths"] ( "County_pop_adjusted_deaths_per1000"))
+
+col_order <- c("Institution_category", "Institution_size", "Land_grant", "Urban_cat", "MOI_Cat", "Test_Type", "State_Mask_Mandate", "Mask_usage_category", "County_Enrollment_Size", "Cases", "Unemployment_rate_2019", "Median_Household_Income_2019",  "Med_HH_Income_Percent_of_State_Total_2019","County_pop_adjusted_cases_per1000", "2019_Population_Estimate")
+               
+#final dataset                   
+Final_dataset_ordered <- Final_dataset[, col_order]
+
+Final_dataset$
+#Setting up Factor analysis dataframe
+famd_data <- as.data.frame(Final_dataset_ordered, cor=TRUE)
+
+str(famd_data)
+print(colnames(famd_data))
+
+#Identifying any multicollinearity in the dataset
+library(corrplot)
+
+collinearity_df <- data.frame(famd_data$Institution_size, famd_data$Land_grant, famd_data$State_Mask_Mandate, famd_data$Mask_usage_category, famd_data$Unemployment_rate_2019, famd_data$Median_Household_Income_2019, famd_data$Urban_cat, famd_data$Test_Type, famd_data$County_Enrollment_Size, famd_data$MOI_Cat, famd_data$County_pop_adjusted_cases_per1000)
+
+collinearity_matrix <- data.matrix(collinearity_df)
+
+str(collinearity_matrix)
+
+multicollinearity_test <- cor(collinearity_matrix, use="pairwise.complete.obs")
+corrplot(multicollinearity_test, method = 'ellipse', order = 'AOE', type = 'upper')
+
+#Weak correlations except for deaths and cases - keep all variables except for deaths (since we're examining impact on cases anyway)
+```
+
+```{r}
+#Multivariate analysis (factor analysis of mixed data) to visualize the archetypes
+
+#Factors impacting county COVID cases
+famd_1 <- MFA(famd_data, 
+               group = c(4,2,3,3,1),
+               type = c("n","n","n","s","s"),
+               name.group = c("Institution_Description","Campus_COVID_mitigation","County_Descriptions","Economic_Demographics", "County_Pop_Adj_Cases"),
+               num.group.sup = c(5),
+               graph = TRUE,
+                ncp = 3)
+print(famd_1)
+summary(famd_1)
+summary(famd_1$global.pca)
+```
+
+
+```{r}
+##Visualization##
+
+#Eigenvalues (greater than 1 means they should be retained for further analysis #Keep variables in Dims 1-4)
+get_eigenvalue(famd_1) 
+
+
+#Amount of variance explained by each dimension
+fviz_screeplot(famd_1)
+
+#Group contribution
+fviz_mfa_var(famd_1, "group")
+# Group Contribution to the first dimension (predominantely County Descriptions)
+fviz_contrib(famd_1, "group", axes = 1)
+# Group Contribution to the second dimension (Predominantely COVID Mit and Institution Description)
+fviz_contrib(famd_1, "group", axes = 2)
+#Group Contribution to third dimension (Predominantely COVID Mit and Institution Description)
+fviz_contrib(famd_1, "group", axes = 3)
+
+#The red dashed line on the graph above indicates the expected average value, If the contributions were uniform. 
+
+
+###Quantitative correlations and dimensions###
+
+#Contributions of quantitative variables to dimension 1 (Median household income)
+fviz_contrib(famd_1, choice = "quanti.var", axes = 1, top = 20,
+             palette = "jco")
+
+# Contributions of quantitative variable to dimension 2
+fviz_contrib(famd_1, choice = "quanti.var", axes = 2, top = 20,
+             palette = "jco")
+
+fviz_contrib(famd_1, choice = "quanti.var", axes = 3, top = 20,
+             palette = "jco")
+```
+
+```{r}
+###Contributions of qualitative variables###
+
+fviz_mfa_var(famd_1, "quali.var", palette = "jco", 
+             col.var.sup = "violet", repel = TRUE,
+             geom = c("point", "text"), legend = "bottom")
+
+# Qualitative variable contributions to dimension 1
+fviz_contrib(famd_1, choice = "quali.var", axes = 1, top = 20,
+             palette = "jco")
+
+# Qualitative variable contributions to dimension 2
+fviz_contrib(famd_1, choice = "quali.var", axes = 2, top = 20,
+             palette = "jco")
+
+# Qualitative variable contributions to dimension 3
+fviz_contrib(famd_1, choice = "quali.var", axes = 3, top = 20,
+             palette = "jco")
+
+fviz_mfa_var(famd_1, "quali.var", col.var = "contrib", 
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             col.var.sup = "violet", repel = FALSE,
+             geom = c("point", "text"))
+
+#cos2 representation (overall quality of the variable represented across the two dimensions)
+fviz_cos2(famd_1, choice = "quali.var", axes = 1)
+fviz_cos2(famd_1, choice = "quanti.var", axes = 1)
+
+```
+
+```{r}
+###Individual Comparisons/Contributions###
+
+fviz_mfa_ind(famd_1, col.ind = "cos2", 
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE)
+
+fviz_mfa_ind(famd_1, 
+             habillage = "Test_Type", # color by groups 
+             addEllipses = TRUE, ellipse.type = "confidence", 
+             repel = TRUE # Avoid text overlapping
+             )
+fviz_ellipses(famd_1, ("Test_Type"), repel = TRUE)
+
+fviz_mfa_ind(famd_1, 
+             habillage = "MOI_Cat", # color by groups 
+             addEllipses = TRUE, ellipse.type = "confidence", 
+             repel = TRUE # Avoid text overlapping
+             ) 
+fviz_ellipses(famd_1, c("MOI_Cat", "Test_Type"), repel = TRUE)
+fviz_ellipses(famd_1, c("MOI_Cat", "Test_Type"), geom = "point")
+
+#Partial axes
+fviz_mfa_axes(famd_1)
+
+```
+
+```{r}
+## Split quantitative and qualitative variables
+split <- splitmix(famd_1)
+
+## FAMD
+res.pcamix <- PCAmix(X.quanti=split$X.quanti,  
+                     X.quali=split$X.quali, rename.level = TRUE)
+
+## Apply varimax rotation to the first two PCs
+res.pcarot <- PCArot(res.pcamix, dim=2,
+                     graph=FALSE)
+
+## Plot - most important variables are the most closely aligned with the axises
+plot(res.pcarot, choice="sqload", 
+     coloring.var=TRUE, axes=c(1, 2))
+```
+
+```{r}
+
+#Hierarchical clustering
+cluster_map <- HCPC(famd_1, nb.clust=-1)
+
+## Plot
+fviz_cluster(cluster_map, geom = "point")
+```
+
+```{r}
+#Analyzing the clusters - identifying the archetypes
+install.packages('devtools')
+library(devtools)
+devtools::install_github("XanderHorn/autoEDA")
+library(autoEDA)
+library(RColorBrewer)
+
+
+## autoEDA 
+auto_res <- autoEDA(cluster_map$data.clust, y = "clust", 
+                    returnPlotList = TRUE,
+                    plotCategorical = "groupedBar", 
+                    bins = 30, rotateLabels = TRUE, 
+                    color = "#26A69A", verbose = FALSE) 
+
+## Plot
+auto_res$plots
+
+#Cluster descriptions
+cluster_map$desc.ind
+cluster_map$desc.var$test.chi2
+cluster_map$desc.var$category
+cluster_map$call$t$nb.clust
+
+```
+
+```{r}
+#Transform cases back into counts, include populations as an offset 
+
+
+Final_dataset_mod <- Final_dataset_ordered %>%
+   select(Institution_category, Institution_size, Land_grant, Urban_cat, MOI_Cat, Test_Type, State_Mask_Mandate, Mask_usage_category, County_Enrollment_Size, Cases, Median_Household_Income_2019, Med_HH_Income_Percent_of_State_Total_2019,`2019_Population_Estimate`)
+
+cases<-Final_dataset_mod$Cases
+ln_pop = log(Final_dataset_mod$`2019_Population_Estimate`)
+schoolsize <-Final_dataset_mod$Institution_size
+schoolcat<-Final_dataset_mod$Institution_category
+landgrant<-Final_dataset_mod$Land_grant
+urbanization<-Final_dataset_mod$Urban_cat
+instruction <-Final_dataset_mod$MOI_Cat
+testtype<-Final_dataset_mod$Test_Type
+mandate<-Final_dataset_mod$State_Mask_Mandate
+maskuse<-Final_dataset_mod$Mask_usage_category
+medincome<-Final_dataset_mod$Median_Household_Income_2019
+percentincomestate<-Final_dataset_mod$Med_HH_Income_Percent_of_State_Total_2019
+enrollment<-Final_dataset_mod$County_Enrollment_Size
+
+
+#Assess distritbution of cases - Variance > mean = overdispersed data  
+hist(cases)
+var(cases)/mean(cases)
+
+k<-mean(cases)^2/(var(cases)-mean(cases))
+bin<-dnbinom(0:9,0.27,mu=0.302)*5190
+both1<-numeric(20)
+tab<- both1[1:20 %% 2 != 0]
+both1[1:20 %% 2 == 0]<-bin
+labels<-character(20)
+labels[1:20 %% 2==0]<-as.character(0:9)
+barplot(both1,col=rep(c("red","yellow"),10),names=labels)
+
+
+# Negative binomial
+library(pscl)
+library(MASS)
+library(magrittr)
+library(flexmix)
+## Load sandwich package for robust sandwich covariance matrix estimators
+library(sandwich)
+library(performance) #check zero inflation
+
+#Split data into training (70%) and testing sets
+set.seed(1234)
+smp_siz = floor(0.70*nrow(Final_dataset_mod))
+train_ind = sample(seq_len(nrow(Final_dataset_mod)),size = smp_siz) 
+
+train = Final_dataset_mod[train_ind,]
+test = Final_dataset_mod[-train_ind,] 
+
+#Training Models
+
+null_mod<-glm.nb(cases ~ 1 + offset(ln_pop), data = train)
+summary(null_mod)
+
+global_mod <- glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + offset(ln_pop), data = train)
+summary(global_mod)
+check_zeroinflation(global_mod, tolerance(0.05))
+
+mod_1<- glm.nb(cases ~ schoolsize + landgrant + urbanization + instruction + mandate + maskuse + enrollment + offset(ln_pop), data = train)
+summary(mod_1)
+
+mod_2<- glm.nb(cases ~ schoolsize + instruction + testtype + offset(ln_pop), data = train)
+summary(mod_2)
+
+mod_3<-glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + mandate + maskuse + enrollment + offset(ln_pop), data = train)
+summary(mod_3)
+
+mod_4<-glm.nb(cases ~ instruction + testtype + offset(ln_pop), data = train)
+summary(mod_4)
+
+mod_5 <- glm.nb(cases ~ schoolsize + urbanization + instruction + mandate + maskuse + enrollment + offset(ln_pop), data = train)
+summary(mod_5)
+
+mod_6 <- glm.nb(cases ~ schoolsize + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + offset(ln_pop), data = train)
+
+mod_7<-glm.nb(cases ~ mandate + maskuse + enrollment + medincome + percentincomestate + offset(ln_pop), data = train)
+
+#Add in additional economic indicators to global model
+global_mod_2 <- glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + medincome + percentincomestate + offset(ln_pop), data = train)
+summary(global_mod_2)
+
+
+#AIC determines global model 2 to be the best fit, BIC determines mod_7
+#Without economic data since we removed it from the PCA)
+
+BIC(null_mod, global_mod, mod_1, mod_2, mod_3, mod_4, mod_5, mod_6)
+AIC(null_mod, global_mod, mod_1, mod_2, mod_3, mod_4, mod_5, mod_6, global_mod_2, mod_7)
+BIC(null_mod, global_mod, mod_1, mod_2, mod_3, mod_4, mod_5, mod_6, global_mod_2, mod_7)
+```
+
+```{r}
+#Testing All Models
+
+null_mod_test<-glm.nb(cases ~ 1 + offset(ln_pop), data = test)
+summary(null_mod_test)
+
+global_mod_test <- glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + offset(ln_pop), data = test)
+summary(global_mod_test)
+
+mod_1_test<- glm.nb(cases ~ schoolsize + landgrant + urbanization + instruction + mandate + maskuse + enrollment + offset(ln_pop), data = test)
+summary(mod_1_test)
+
+mod_2_test<- glm.nb(cases ~ schoolsize + instruction + testtype + offset(ln_pop), data = test)
+summary(mod_2_test)
+
+mod_3_test<-glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + mandate + maskuse + enrollment + offset(ln_pop), data = test)
+summary(mod_3_test)
+
+mod_4_test<-glm.nb(cases ~ instruction + testtype + offset(ln_pop), data = test)
+summary(mod_4_test)
+
+mod_5_test <- glm.nb(cases ~ schoolsize + urbanization + instruction + mandate + maskuse + enrollment + offset(ln_pop), data = test)
+summary(mod_5_test)
+
+mod_6_test <- glm.nb(cases ~ schoolsize + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + offset(ln_pop), data = test)
+summary(mod_6_test)
+
+global_mod_2_test <- glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + medincome + offset(ln_pop), data = test)
+summary(global_mod_2_test)
+
+mod_7_test<-glm.nb(cases ~ mandate + maskuse + enrollment + medincome + percentincomestate + offset(ln_pop), data = test)
+
+AIC(null_mod_test, global_mod_test, mod_1_test, mod_2_test, mod_3_test, mod_4_test, mod_5_test, mod_6_test, global_mod_2_test, mod_7_test)
+
+BIC(null_mod_test, global_mod_test, mod_1_test, mod_2_test, mod_3_test, mod_4_test, mod_5_test, mod_6_test, global_mod_2_test, mod_7_test)
+
+library(see)
+
+compare_performance(global_mod, global_mod_2, mod_7, rank = TRUE)
+global_mod_2_result<-binned_residuals(global_mod_2)
+check_collinearity(global_mod_2)
+outliers<-check_outliers(global_mod_2)
+posterior<- check_posterior_predictions(global_mod_2)
+plot(posterior)
+check_model(global_mod_2)
+binned_residuals(global_mod_2)
+binned_residuals(global_mod)
+```
+
+```{r}
+#Training Only School-Based Models
+
+null_mod_school_train<-glm.nb(cases ~ 1 + offset(ln_pop), data = train)
+summary(null_mod_school_train)
+
+mod_1_school<- glm.nb(cases ~ instruction + testtype + schoolsize + offset(ln_pop), data = train)
+summary(mod_1_school)
+
+mod_2_school<- glm.nb(cases ~ testtype + schoolsize + offset(ln_pop), data = train)
+summary(mod_2_school)
+
+mod_3_school<- glm.nb(cases ~ instruction + schoolsize + offset(ln_pop), data = train)
+summary(mod_3_school)
+
+mod_4_school<- glm.nb(cases ~ instruction + testtype + offset(ln_pop), data = train)
+summary(mod_4_school)
+
+performance_1<- compare_performance(mod_1_school, mod_2_school, mod_3_school, mod_4_school, rank = TRUE)
+plot(performance_1)
+compare_performance(mod_1_school,mod_2_school, mod_3_school, mod_4_school, rank=TRUE)
+BIC(mod_1_school,mod_2_school, mod_3_school, mod_4_school)
+check_model(mod_2_school)
+check_model(mod_3_school)
+binned_residuals(mod_2_school)
+binned_residuals(mod_3_school)
+```
+
+```{r}
+#Full Dataset
+
+null_mod_full<-glm.nb(cases ~ 1 + offset(ln_pop), data = Final_dataset_mod)
+summary(null_mod_full)
+
+mod_1_school_full<- glm.nb(cases ~ instruction + testtype + schoolsize + offset(ln_pop), data = Final_dataset_mod)
+summary(mod_1_school_full)
+
+mod_2_school_full<- glm.nb(cases ~ testtype + schoolsize + offset(ln_pop), data = Final_dataset_mod)
+summary(mod_2_school_full)
+
+mod_3_school_full<- glm.nb(cases ~ instruction + schoolsize + offset(ln_pop), data = Final_dataset_mod)
+summary(mod_3_school_full)
+
+mod_4_school_full<- glm.nb(cases ~ instruction + testtype + offset(ln_pop), data = Final_dataset_mod)
+summary(mod_4_school_full)
+
+performance_1_full<- compare_performance(mod_1_school_full,mod_2_school_full, mod_3_school_full, mod_4_school_full, rank = TRUE)
+plot(performance_1_full)
+compare_performance(mod_1_school_full,mod_2_school_full, mod_3_school_full, mod_4_school_full, rank = TRUE)
+BIC(mod_1_school,mod_2_school, mod_3_school, mod_4_school)
+check_model(mod_1_school_full)
+check_model(mod_2_school_full)
+check_model(mod_3_school_full)
+binned_residuals(mod_1_school_full)
+binned_residuals(mod_2_school_full)
+binned_residuals(mod_3_school_full)
+binned_residuals(mod_4_school_full)
+```
+
+```{r}
+#Validating Models
+library(Metrics)
+library(see)
+library(performance)
+
+rmse = function(y, ypred) {
+rmse = sqrt(mean((y - ypred)^2))
+return(rmse)
+}
+
+#Global mod 2
+global_mod_2 <- glm.nb(cases ~ schoolsize + schoolcat + landgrant + urbanization + instruction + testtype + mandate + maskuse + enrollment + medincome + percentincomestate + offset(ln_pop), data = train)
+
+nb.train = predict(global_mod_2)
+rmse(train$Cases, nb.train) 
+#7053451
+
+nb.test = predict(global_mod_2, data=test)
+rmse(test$Cases, nb.test)
+#6417236
+
+#Global mod
+
+nb.train = predict(global_mod)
+rmse(train$Cases, nb.train) 
+#7053451
+
+nb.test = predict(global_mod, data=test)
+rmse(test$Cases, nb.test)
+#6417236
+
+
+null_mod_test<-glm.nb(cases ~ 1 + offset(ln_pop), data = test)
+summary(null_mod_test)
+
+mod_1_school_test<- glm.nb(cases ~ instruction + testtype + schoolsize + offset(ln_pop), data = test)
+summary(mod_1_school_test)
+
+mod_2_school_test<- glm.nb(cases ~ testtype + schoolsize + offset(ln_pop), data = test)
+summary(mod_2_school_test)
+
+mod_3_school_test<- glm.nb(cases ~ instruction + schoolsize + offset(ln_pop), data = test)
+summary(mod_3_school_test)
+
+mod_4_school_test<- glm.nb(cases ~ instruction + testtype + offset(ln_pop), data = test)
+summary(mod_4_school_test)
+
+performance_2<- compare_performance(mod_1_school_test,mod_2_school_test, mod_3_school_test, mod_4_school_test, rank = TRUE)
+plot(performance_2)
+compare_performance(mod_1_school_test,mod_2_school_test, mod_3_school_test, mod_4_school_test, rank = TRUE)
+BIC(mod_1_school,mod_2_school, mod_3_school, mod_4_school)
+check_model(mod_2_school)
+check_model(mod_3_school)
+binned_residuals(mod_1_school_test)
+binned_residuals(mod_2_school_test)
+
+```
+
